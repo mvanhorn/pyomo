@@ -17,6 +17,7 @@ from pyomo.environ import (
     Var,
     Set,
     Constraint,
+    Expression,
     sin,
     log,
     sqrt,
@@ -959,6 +960,111 @@ class TestSimulator(unittest.TestCase):
         self.assertEqual(len(mysim._templatemap), 1)
         self.assertEqual(mysim._diffvars[0], _GetItemIndexer(m.v2[t]))
         m.del_component('con')
+
+    # Indexed Expressions are definitional and must not become algebraic
+    # variables. SciPy and CasADi both walk the expression rule body.
+    @unittest.skipIf(not scipy_available, "Scipy is not available")
+    def test_indexed_expression_scipy(self):
+        m = self.m
+        m.a = Var(m.t)
+        m.alias = Expression(m.t, rule=lambda m, t: 2.0 * m.a[t])
+
+        def _diffeq(m, t):
+            return m.dv[t] == m.v[t] ** 2 + m.alias[t]
+
+        m.con = Constraint(m.t, rule=_diffeq)
+        mysim = Simulator(m)
+        t = IndexTemplate(m.t)
+
+        self.assertEqual(len(mysim._algvars), 1)
+        self.assertIn(_GetItemIndexer(m.a[t]), mysim._algvars)
+        self.assertNotIn(_GetItemIndexer(m.alias[t]), mysim._templatemap)
+        self.assertIn(_GetItemIndexer(m.v[t]), mysim._templatemap)
+        self.assertEqual(mysim._diffvars, [_GetItemIndexer(m.v[t])])
+        self.assertEqual(mysim._derivlist, [_GetItemIndexer(m.dv[t])])
+        self.assertEqual(len(mysim._alglist), 0)
+        m.del_component('con')
+        m.del_component('alias')
+        m.del_component('a')
+
+    @unittest.skipIf(not casadi_available, "casadi not available")
+    def test_indexed_expression_casadi(self):
+        # Reproducer: an Expression alias of the algebraic state must not
+        # be counted as a second algebraic variable (IDAS: "Dimension
+        # mismatch for 'alg'").
+        m = self.m
+        m.v[m.t.first()].set_value(1.0)
+        m.y = Var(m.t, initialize=0.5)
+        m.y_alias = Expression(m.t, rule=lambda m, t: 2.0 * m.y[t])
+
+        def _ode(m, t):
+            return m.dv[t] == -m.v[t] + m.y_alias[t]
+
+        def _alg(m, t):
+            return m.y[t] == 0.5
+
+        m.ode = Constraint(m.t, rule=_ode)
+        m.alg = Constraint(m.t, rule=_alg)
+
+        mysim = Simulator(m, package='casadi')
+        t = IndexTemplate(m.t)
+
+        self.assertEqual(len(mysim._diffvars), 1)
+        self.assertEqual(mysim._diffvars[0], _GetItemIndexer(m.v[t]))
+        self.assertEqual(mysim._derivlist, [_GetItemIndexer(m.dv[t])])
+        self.assertEqual(len(mysim._algvars), 1)
+        self.assertEqual(mysim._algvars[0], _GetItemIndexer(m.y[t]))
+        self.assertEqual(len(mysim._alglist), 1)
+        self.assertNotIn(_GetItemIndexer(m.y_alias[t]), mysim._templatemap)
+        self.assertIn(_GetItemIndexer(m.y[t]), mysim._templatemap)
+        self.assertIn(_GetItemIndexer(m.v[t]), mysim._templatemap)
+
+        tsim, profile = mysim.simulate(numpoints=5, integrator='idas')
+        self.assertEqual(len(tsim), 5)
+        self.assertEqual(profile.shape, (5, 2))
+        for row in profile:
+            self.assertAlmostEqual(row[0], 1.0, places=4)
+            self.assertAlmostEqual(row[1], 0.5, places=4)
+
+        m.del_component('ode')
+        m.del_component('alg')
+        m.del_component('y_alias')
+        m.del_component('y')
+
+    def test_indexed_expression_template_index_error(self):
+        m = self.m
+
+        def _alias(m, t):
+            # Valid for the concrete ContinuousSet points used at
+            # construction. The simulator's template index cannot be
+            # coerced to float.
+            if float(t) < 5:
+                return m.v[t]
+            return 2.0 * m.v[t]
+
+        m.alias = Expression(m.t, rule=_alias)
+
+        def _deq(m, t):
+            return m.dv[t] == m.alias[t]
+
+        m.con = Constraint(m.t, rule=_deq)
+
+        packages = []
+        if scipy_available:
+            packages.append('scipy')
+        if casadi_available:
+            packages.append('casadi')
+        if not packages:
+            self.skipTest("Neither SciPy nor CasADi is available")
+
+        for pkg in packages:
+            with self.assertRaisesRegex(
+                DAE_Error, "Cannot expand indexed Expression 'alias'"
+            ):
+                Simulator(m, package=pkg)
+
+        m.del_component('con')
+        m.del_component('alias')
 
 
 class TestExpressionCheckers(unittest.TestCase):

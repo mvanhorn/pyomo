@@ -9,7 +9,7 @@
 
 import logging
 
-from pyomo.core.base import Constraint, Param, value, Suffix, Block
+from pyomo.core.base import Constraint, Expression, Param, value, Suffix, Block
 from pyomo.dae import ContinuousSet, DerivativeVar
 from pyomo.dae.diffvar import DAE_Error
 import pyomo.core.expr as EXPR
@@ -205,6 +205,48 @@ def _check_viewsumexpression(expr, i):
     return None
 
 
+def _expand_indexed_expression(visitor, child):
+    """Expand an indexed ``Expression`` reference through its rule.
+
+    ``child`` is a :class:`GetItemExpression`.  When its base is an
+    indexed :class:`Expression`, the rule is evaluated at the template
+    index and the resulting body is walked with ``visitor`` before any
+    template symbols are created.  Only actual model variables therefore
+    become template entries.  Returns ``(True, substituted)`` in that
+    case.
+
+    Indexed :class:`Var` and derivative references return
+    ``(False, None)`` so the caller can keep its existing template-map
+    handling.  A :class:`DAE_Error` is raised when the expression rule
+    cannot be evaluated at the template index.
+    """
+    base = child.arg(0)
+    if not isinstance(base, Expression) or not base.is_indexed():
+        return False, None
+
+    idx = child.args[1:]
+    if len(idx) == 1:
+        idx = idx[0]
+    try:
+        if base._rule is None:
+            body = None
+        else:
+            body = base._rule(base.parent_block(), idx)
+    except Exception:
+        raise DAE_Error(
+            "Cannot expand indexed Expression '%s' from the template "
+            "index. The expression rule could not be evaluated with "
+            "the template index." % (base.name,)
+        ) from None
+    if body is None or body is Expression.Skip:
+        raise DAE_Error(
+            "Cannot expand indexed Expression '%s' from the template "
+            "index. The expression rule did not return an expression "
+            "that can be simulated." % (base.name,)
+        )
+    return True, visitor.walk_expression(body)
+
+
 class Pyomo2Scipy_Visitor(EXPR.ExpressionReplacementVisitor):
     """
     Expression walker that replaces _GetItemExpression
@@ -225,6 +267,11 @@ class Pyomo2Scipy_Visitor(EXPR.ExpressionReplacementVisitor):
             return False, child
 
         if isinstance(child, EXPR.GetItemExpression):
+            # Expand Expression[t] through its rule so a derived quantity
+            # is not registered as an independent template variable.
+            handled, expanded = _expand_indexed_expression(self, child)
+            if handled:
+                return False, expanded
             _id = _GetItemIndexer(child)
             if _id not in self.templatemap:
                 self.templatemap[_id] = Param(mutable=True)
@@ -291,6 +338,11 @@ class Substitute_Pyomo2Casadi_Visitor(EXPR.ExpressionReplacementVisitor):
     def beforeChild(self, node, child, child_idx):
         """Replace a node if it's a _GetItemExpression."""
         if isinstance(child, EXPR.GetItemExpression):
+            # Expand Expression[t] through its rule so a derived quantity
+            # is not registered as an independent template variable.
+            handled, expanded = _expand_indexed_expression(self, child)
+            if handled:
+                return False, expanded
             _id = _GetItemIndexer(child)
             if _id not in self.templatemap:
                 name = "%s[%s]" % (_id.base.name, ','.join(str(x) for x in _id.args))
